@@ -789,6 +789,230 @@ void hwss_build_fast_sequence(struct dc *dc,
 		(*num_steps)++;
 	}
 
+	if (dc->hwss.setup_periodic_interrupt && stream->update_flags.bits.periodic_interrupt) {
+		block_sequence[*num_steps].params.setup_periodic_interrupt_params.dc = dc;
+		block_sequence[*num_steps].params.setup_periodic_interrupt_params.pipe_ctx = pipe_ctx;
+		block_sequence[*num_steps].func = HWSS_SETUP_PERIODIC_INTERRUPT;
+		(*num_steps)++;
+	}
+
+	if (stream->update_flags.bits.info_frame) {
+		resource_build_info_frame(pipe_ctx);
+		block_sequence[*num_steps].params.update_info_frame_params.dc = dc;
+		block_sequence[*num_steps].params.update_info_frame_params.pipe_ctx = pipe_ctx;
+		block_sequence[*num_steps].func = HWSS_UPDATE_INFO_FRAME;
+		(*num_steps)++;
+
+		if (dc_is_dp_signal(pipe_ctx->stream->signal)) {
+			block_sequence[*num_steps].params.dp_trace_source_sequence_params.link = pipe_ctx->stream->link;
+			block_sequence[*num_steps].params.dp_trace_source_sequence_params.source = DPCD_SOURCE_SEQ_AFTER_UPDATE_INFO_FRAME;
+			block_sequence[*num_steps].func = DP_TRACE_SOURCE_SEQUENCE;
+			(*num_steps)++;
+		}
+	}
+
+	if (dc->hwss.set_dmdata_attributes && stream->update_flags.bits.dmdata &&
+			stream->use_dynamic_meta && pipe_ctx->stream->dmdata_address.quad_part != 0) {
+		struct dc_dmdata_attributes attr = { 0 };
+
+		attr.dmdata_mode = DMDATA_HW_MODE;
+		attr.dmdata_size = dc_is_hdmi_signal(pipe_ctx->stream->signal) ? 32 : 36;
+		attr.address.quad_part = pipe_ctx->stream->dmdata_address.quad_part;
+		attr.dmdata_dl_delta = 0;
+		attr.dmdata_qos_mode = 0;
+		attr.dmdata_qos_level = 0;
+		attr.dmdata_repeat = 1; /* always repeat */
+		attr.dmdata_updated = 1;
+		attr.dmdata_sw_data = NULL;
+
+		block_sequence[*num_steps].params.set_dmdata_attributes_params.hubp = pipe_ctx->plane_res.hubp;
+		block_sequence[*num_steps].params.set_dmdata_attributes_params.attr = attr;
+		block_sequence[*num_steps].func = HUBP_SET_DMDATA_ATTRIBUTES;
+		(*num_steps)++;
+	}
+
+	/* Track cursor lock state - separate locks for attribute and position updates */
+	bool enable_cursor_offload = false;
+
+	if ((dc->hwss.set_cursor_attribute && stream->update_flags.bits.cursor_attr) ||
+		(dc->hwss.set_cursor_position && stream->update_flags.bits.cursor_pos))
+		enable_cursor_offload = dc_dmub_srv_is_cursor_offload_enabled(dc);
+
+	/* Cursor attribute updates - separate lock/iterate/unlock */
+	if (dc->hwss.set_cursor_attribute && stream->update_flags.bits.cursor_attr) {
+		struct pipe_ctx *cursor_pipe_to_program = NULL;
+
+		for (i = 0; i < MAX_PIPES; i++) {
+			current_pipe = &context->res_ctx.pipe_ctx[i];
+
+			if (current_pipe->stream != stream)
+				continue;
+
+			if (!cursor_pipe_to_program) {
+				cursor_pipe_to_program = current_pipe;
+
+				if (enable_cursor_offload && dc->hwss.begin_cursor_offload_update) {
+					block_sequence[*num_steps].params.begin_cursor_offload_update_params.dc = dc;
+					block_sequence[*num_steps].params.begin_cursor_offload_update_params.pipe_ctx =
+						current_pipe;
+					block_sequence[*num_steps].func = HWSS_BEGIN_CURSOR_OFFLOAD_UPDATE;
+					(*num_steps)++;
+				} else {
+					block_sequence[*num_steps].params.cursor_lock_params.dc = dc;
+					block_sequence[*num_steps].params.cursor_lock_params.pipe_ctx = current_pipe;
+					block_sequence[*num_steps].params.cursor_lock_params.lock = true;
+					block_sequence[*num_steps].func = HWSS_CURSOR_LOCK;
+					(*num_steps)++;
+
+					if (current_pipe->next_odm_pipe) {
+						block_sequence[*num_steps].params.cursor_lock_params.dc = dc;
+						block_sequence[*num_steps].params.cursor_lock_params.pipe_ctx =
+							current_pipe->next_odm_pipe;
+						block_sequence[*num_steps].params.cursor_lock_params.lock = true;
+						block_sequence[*num_steps].func = HWSS_CURSOR_LOCK;
+						(*num_steps)++;
+					}
+				}
+			}
+
+			block_sequence[*num_steps].params.hubp_set_cursor_attributes_params.hubp =
+				current_pipe->plane_res.hubp;
+			block_sequence[*num_steps].params.hubp_set_cursor_attributes_params.attributes =
+				&current_pipe->stream->cursor_attributes;
+			block_sequence[*num_steps].func = HUBP_SET_CURSOR_ATTRIBUTES;
+			(*num_steps)++;
+
+			block_sequence[*num_steps].params.dpp_set_cursor_attributes_params.dpp =
+				current_pipe->plane_res.dpp;
+			block_sequence[*num_steps].params.dpp_set_cursor_attributes_params.attributes =
+				&current_pipe->stream->cursor_attributes;
+			block_sequence[*num_steps].func = DPP_SET_CURSOR_ATTRIBUTES;
+			(*num_steps)++;
+
+			if (dc->ctx->dmub_srv) {
+				block_sequence[*num_steps].params.send_cursor_info_to_dmu_params.pipe_ctx =
+					current_pipe;
+				block_sequence[*num_steps].params.send_cursor_info_to_dmu_params.pipe_idx =
+					current_pipe->pipe_idx;
+				block_sequence[*num_steps].func = DC_SEND_CURSOR_INFO_TO_DMU;
+				(*num_steps)++;
+			}
+
+			block_sequence[*num_steps].params.set_cursor_sdr_white_level_params.dc = dc;
+			block_sequence[*num_steps].params.set_cursor_sdr_white_level_params.pipe_ctx =
+				current_pipe;
+			block_sequence[*num_steps].func = SET_CURSOR_SDR_WHITE_LEVEL;
+			(*num_steps)++;
+
+			if (enable_cursor_offload && dc->hwss.update_cursor_offload_pipe) {
+				block_sequence[*num_steps].params.update_cursor_offload_pipe_params.dc = dc;
+				block_sequence[*num_steps].params.update_cursor_offload_pipe_params.pipe_ctx =
+					current_pipe;
+				block_sequence[*num_steps].func = HWSS_UPDATE_CURSOR_OFFLOAD_PIPE;
+				(*num_steps)++;
+			}
+		}
+
+		/* Unlock cursor attributes after all pipes have been programmed */
+		if (cursor_pipe_to_program) {
+			if (enable_cursor_offload && dc->hwss.commit_cursor_offload_update) {
+				block_sequence[*num_steps].params.commit_cursor_offload_update_params.dc = dc;
+				block_sequence[*num_steps].params.commit_cursor_offload_update_params.pipe_ctx =
+					cursor_pipe_to_program;
+				block_sequence[*num_steps].func = HWSS_COMMIT_CURSOR_OFFLOAD_UPDATE;
+				(*num_steps)++;
+			} else {
+				block_sequence[*num_steps].params.cursor_lock_params.dc = dc;
+				block_sequence[*num_steps].params.cursor_lock_params.pipe_ctx = cursor_pipe_to_program;
+				block_sequence[*num_steps].params.cursor_lock_params.lock = false;
+				block_sequence[*num_steps].func = HWSS_CURSOR_LOCK;
+				(*num_steps)++;
+
+				if (cursor_pipe_to_program->next_odm_pipe) {
+					block_sequence[*num_steps].params.cursor_lock_params.dc = dc;
+					block_sequence[*num_steps].params.cursor_lock_params.pipe_ctx =
+						cursor_pipe_to_program->next_odm_pipe;
+					block_sequence[*num_steps].params.cursor_lock_params.lock = false;
+					block_sequence[*num_steps].func = HWSS_CURSOR_LOCK;
+					(*num_steps)++;
+				}
+			}
+		}
+	}
+
+	/* Cursor position updates */
+	if (dc->hwss.set_cursor_position && stream->update_flags.bits.cursor_pos) {
+		struct pipe_ctx *cursor_pipe_to_program = NULL;
+
+		for (i = 0; i < MAX_PIPES; i++) {
+			current_pipe = &context->res_ctx.pipe_ctx[i];
+
+			if (current_pipe->stream != stream ||
+					(!current_pipe->plane_res.mi && !current_pipe->plane_res.hubp) ||
+					!current_pipe->plane_state ||
+					(!current_pipe->plane_res.xfm && !current_pipe->plane_res.dpp) ||
+					(!current_pipe->plane_res.ipp && !current_pipe->plane_res.dpp))
+				continue;
+
+			if (!cursor_pipe_to_program) {
+				cursor_pipe_to_program = current_pipe;
+
+				if (enable_cursor_offload && dc->hwss.begin_cursor_offload_update) {
+					block_sequence[*num_steps].params.begin_cursor_offload_update_params.dc = dc;
+					block_sequence[*num_steps].params.begin_cursor_offload_update_params.pipe_ctx =
+						current_pipe;
+					block_sequence[*num_steps].func = HWSS_BEGIN_CURSOR_OFFLOAD_UPDATE;
+					(*num_steps)++;
+				} else {
+					block_sequence[*num_steps].params.cursor_lock_params.dc = dc;
+					block_sequence[*num_steps].params.cursor_lock_params.pipe_ctx = current_pipe;
+					block_sequence[*num_steps].params.cursor_lock_params.lock = true;
+					block_sequence[*num_steps].func = HWSS_CURSOR_LOCK;
+					(*num_steps)++;
+				}
+			}
+
+			block_sequence[*num_steps].params.set_cursor_position_params.dc = dc;
+			block_sequence[*num_steps].params.set_cursor_position_params.pipe_ctx = current_pipe;
+			block_sequence[*num_steps].func = SET_CURSOR_POSITION;
+			(*num_steps)++;
+
+			if (enable_cursor_offload && dc->hwss.update_cursor_offload_pipe) {
+				block_sequence[*num_steps].params.update_cursor_offload_pipe_params.dc = dc;
+				block_sequence[*num_steps].params.update_cursor_offload_pipe_params.pipe_ctx =
+					current_pipe;
+				block_sequence[*num_steps].func = HWSS_UPDATE_CURSOR_OFFLOAD_PIPE;
+				(*num_steps)++;
+			}
+
+			if (dc->ctx->dmub_srv) {
+				block_sequence[*num_steps].params.send_cursor_info_to_dmu_params.pipe_ctx =
+					current_pipe;
+				block_sequence[*num_steps].params.send_cursor_info_to_dmu_params.pipe_idx =
+					current_pipe->pipe_idx;
+				block_sequence[*num_steps].func = DC_SEND_CURSOR_INFO_TO_DMU;
+				(*num_steps)++;
+			}
+		}
+
+		/* Unlock cursor position after all pipes have been programmed */
+		if (cursor_pipe_to_program) {
+			if (enable_cursor_offload && dc->hwss.commit_cursor_offload_update) {
+				block_sequence[*num_steps].params.commit_cursor_offload_update_params.dc = dc;
+				block_sequence[*num_steps].params.commit_cursor_offload_update_params.pipe_ctx =
+					cursor_pipe_to_program;
+				block_sequence[*num_steps].func = HWSS_COMMIT_CURSOR_OFFLOAD_UPDATE;
+				(*num_steps)++;
+			} else {
+				block_sequence[*num_steps].params.cursor_lock_params.dc = dc;
+				block_sequence[*num_steps].params.cursor_lock_params.pipe_ctx = cursor_pipe_to_program;
+				block_sequence[*num_steps].params.cursor_lock_params.lock = false;
+				block_sequence[*num_steps].func = HWSS_CURSOR_LOCK;
+				(*num_steps)++;
+			}
+		}
+	}
+
 	current_pipe = pipe_ctx;
 	while (current_pipe) {
 		current_mpc_pipe = current_pipe;
@@ -990,6 +1214,22 @@ void hwss_execute_sequence(struct dc *dc,
 			break;
 		case DPP_PROGRAM_GAMUT_REMAP:
 			dc->hwss.program_gamut_remap(params->program_gamut_remap_params.pipe_ctx);
+			hwss_program_gamut_remap(params);
+			break;
+		case HUBP_ENABLE_3DLUT_FL:
+			hwss_hubp_enable_3dlut_fl(params);
+			break;
+		case OTG_SETUP_VERTICAL_INTERRUPT:
+			hwss_tg_setup_vertical_interrupt0(params);
+			break;
+		case HWSS_SETUP_PERIODIC_INTERRUPT:
+			hwss_setup_periodic_interrupt(dc, params);
+			break;
+		case HWSS_UPDATE_INFO_FRAME:
+			hwss_update_info_frame(dc, params);
+			break;
+		case HUBP_SET_DMDATA_ATTRIBUTES:
+			hwss_set_dmdata_attributes(params);
 			break;
 		case DPP_SETUP_DPP:
 			hwss_setup_dpp(params);
@@ -1328,6 +1568,57 @@ void hwss_execute_sequence(struct dc *dc,
 			break;
 		case PHANTOM_HUBP_POST_ENABLE:
 			hwss_phantom_hubp_post_enable(params);
+			break;
+		case STREAM_ENC_UPDATE_HDMI_INFO_PACKETS:
+			hwss_stream_enc_update_hdmi_info_packets(params);
+			break;
+		case HPO_DP_STREAM_ENC_UPDATE_DP_INFO_PACKETS_SDP_LINE_NUM:
+			hwss_hpo_dp_stream_enc_update_dp_info_packets_sdp_line_num(params);
+			break;
+		case HPO_DP_STREAM_ENC_UPDATE_DP_INFO_PACKETS:
+			hwss_hpo_dp_stream_enc_update_dp_info_packets(params);
+			break;
+		case STREAM_ENC_UPDATE_DP_INFO_PACKETS_SDP_LINE_NUM:
+			hwss_stream_enc_update_dp_info_packets_sdp_line_num(params);
+			break;
+		case STREAM_ENC_UPDATE_DP_INFO_PACKETS:
+			hwss_stream_enc_update_dp_info_packets(params);
+			break;
+		case DSC_SET_CONFIG_SIMPLE:
+			hwss_dsc_set_config_simple(params);
+			break;
+		case STREAM_ENC_DP_SET_DSC_CONFIG:
+			hwss_stream_enc_dp_set_dsc_config(params);
+			break;
+		case HPO_DP_STREAM_ENC_DP_SET_DSC_PPS_INFO_PACKET:
+			hwss_hpo_dp_stream_enc_dp_set_dsc_pps_info_packet(params);
+			break;
+		case STREAM_ENC_DP_SET_DSC_PPS_INFO_PACKET:
+			hwss_stream_enc_dp_set_dsc_pps_info_packet(params);
+			break;
+		case DP_TRACE_SOURCE_SEQUENCE:
+			hwss_dp_trace_source_sequence(params);
+			break;
+		case LINK_INCREASE_MST_PAYLOAD:
+			hwss_link_increase_mst_payload(params);
+			break;
+		case LINK_REDUCE_MST_PAYLOAD:
+			hwss_link_reduce_mst_payload(params);
+			break;
+		case DP_SET_TEST_PATTERN:
+			hwss_dp_set_test_pattern(params);
+			break;
+		case LINK_SET_DPMS_OFF:
+			hwss_link_set_dpms_off(params);
+			break;
+		case DISABLE_AUDIO_STREAM:
+			hwss_disable_audio_stream(dc, params);
+			break;
+		case PREPARE_BANDWIDTH:
+			hwss_prepare_bandwidth(dc, params);
+			break;
+		case LINK_SET_DPMS_ON:
+			hwss_link_set_dpms_on(params);
 			break;
 		default:
 			ASSERT(false);
@@ -1947,6 +2238,16 @@ void hwss_add_tg_wait_double_buffer_pending(struct block_sequence_state *seq_sta
 	}
 }
 
+void hwss_add_hubp_enable_3dlut_fl(struct block_sequence_state *seq_state,
+		struct hubp *hubp)
+{
+	if (*seq_state->num_steps < MAX_HWSS_BLOCK_SEQUENCE_SIZE) {
+		seq_state->steps[*seq_state->num_steps].params.hubp_enable_3dlut_fl_params.hubp = hubp;
+		seq_state->steps[*seq_state->num_steps].func = HUBP_ENABLE_3DLUT_FL;
+		(*seq_state->num_steps)++;
+	}
+}
+
 void hwss_program_manual_trigger(union block_sequence_params *params)
 {
 	struct pipe_ctx *pipe_ctx = params->program_manual_trigger_params.pipe_ctx;
@@ -2414,6 +2715,40 @@ void hwss_tg_set_vtg_params(union block_sequence_params *params)
 
 	if (tg->funcs->set_vtg_params)
 		tg->funcs->set_vtg_params(tg, timing, program_fp2);
+}
+
+void hwss_hubp_enable_3dlut_fl(union block_sequence_params *params)
+{
+	struct hubp *hubp = params->hubp_enable_3dlut_fl_params.hubp;
+
+	if (hubp->funcs->hubp_enable_3dlut_fl)
+		hubp->funcs->hubp_enable_3dlut_fl(hubp, true);
+}
+
+void hwss_update_info_frame(struct dc *dc, union block_sequence_params *params)
+{
+	struct pipe_ctx *pipe_ctx = params->update_info_frame_params.pipe_ctx;
+
+	if (dc->hwss.update_info_frame)
+		dc->hwss.update_info_frame(pipe_ctx);
+}
+
+void hwss_setup_periodic_interrupt(struct dc *dc, union block_sequence_params *params)
+{
+	struct pipe_ctx *pipe_ctx = params->setup_periodic_interrupt_params.pipe_ctx;
+
+	if (dc->hwss.setup_periodic_interrupt)
+		dc->hwss.setup_periodic_interrupt(dc, pipe_ctx);
+}
+
+void hwss_tg_setup_vertical_interrupt0(union block_sequence_params *params)
+{
+	struct timing_generator *tg = params->tg_setup_vertical_interrupt0_params.tg;
+	uint32_t start_line = params->tg_setup_vertical_interrupt0_params.start_line;
+	uint32_t end_line = params->tg_setup_vertical_interrupt0_params.end_line;
+
+	if (tg->funcs->setup_vertical_interrupt0)
+		tg->funcs->setup_vertical_interrupt0(tg, start_line, end_line);
 }
 
 void hwss_tg_setup_vertical_interrupt2(union block_sequence_params *params)
@@ -3167,6 +3502,198 @@ void hwss_phantom_hubp_post_enable(union block_sequence_params *params)
 
 	if (hubp && hubp->funcs->phantom_hubp_post_enable)
 		hubp->funcs->phantom_hubp_post_enable(hubp);
+}
+
+void hwss_stream_enc_update_hdmi_info_packets(union block_sequence_params *params)
+{
+	if (params->stream_enc_update_hdmi_info_packets_params.pipe_ctx->stream_res.stream_enc &&
+	    params->stream_enc_update_hdmi_info_packets_params.pipe_ctx->stream_res.stream_enc->funcs->update_hdmi_info_packets)
+		params->stream_enc_update_hdmi_info_packets_params.pipe_ctx->stream_res.stream_enc->funcs->update_hdmi_info_packets(
+			params->stream_enc_update_hdmi_info_packets_params.pipe_ctx->stream_res.stream_enc,
+			&params->stream_enc_update_hdmi_info_packets_params.pipe_ctx->stream_res.encoder_info_frame);
+}
+
+void hwss_hpo_dp_stream_enc_update_dp_info_packets_sdp_line_num(union block_sequence_params *params)
+{
+	if (params->hpo_dp_stream_enc_update_dp_info_packets_sdp_line_num_params.pipe_ctx->stream_res.hpo_dp_stream_enc &&
+	    params->hpo_dp_stream_enc_update_dp_info_packets_sdp_line_num_params.pipe_ctx->stream_res.hpo_dp_stream_enc->funcs->update_dp_info_packets_sdp_line_num)
+		params->hpo_dp_stream_enc_update_dp_info_packets_sdp_line_num_params.pipe_ctx->stream_res.hpo_dp_stream_enc->funcs->update_dp_info_packets_sdp_line_num(
+			params->hpo_dp_stream_enc_update_dp_info_packets_sdp_line_num_params.pipe_ctx->stream_res.hpo_dp_stream_enc,
+			&params->hpo_dp_stream_enc_update_dp_info_packets_sdp_line_num_params.pipe_ctx->stream_res.encoder_info_frame);
+}
+
+void hwss_hpo_dp_stream_enc_update_dp_info_packets(union block_sequence_params *params)
+{
+	if (params->hpo_dp_stream_enc_update_dp_info_packets_params.pipe_ctx->stream_res.hpo_dp_stream_enc &&
+	    params->hpo_dp_stream_enc_update_dp_info_packets_params.pipe_ctx->stream_res.hpo_dp_stream_enc->funcs->update_dp_info_packets)
+		params->hpo_dp_stream_enc_update_dp_info_packets_params.pipe_ctx->stream_res.hpo_dp_stream_enc->funcs->update_dp_info_packets(
+			params->hpo_dp_stream_enc_update_dp_info_packets_params.pipe_ctx->stream_res.hpo_dp_stream_enc,
+			&params->hpo_dp_stream_enc_update_dp_info_packets_params.pipe_ctx->stream_res.encoder_info_frame);
+}
+
+void hwss_stream_enc_update_dp_info_packets_sdp_line_num(union block_sequence_params *params)
+{
+	if (params->stream_enc_update_dp_info_packets_sdp_line_num_params.pipe_ctx->stream_res.stream_enc &&
+	    params->stream_enc_update_dp_info_packets_sdp_line_num_params.pipe_ctx->stream_res.stream_enc->funcs->update_dp_info_packets_sdp_line_num)
+		params->stream_enc_update_dp_info_packets_sdp_line_num_params.pipe_ctx->stream_res.stream_enc->funcs->update_dp_info_packets_sdp_line_num(
+			params->stream_enc_update_dp_info_packets_sdp_line_num_params.pipe_ctx->stream_res.stream_enc,
+			&params->stream_enc_update_dp_info_packets_sdp_line_num_params.pipe_ctx->stream_res.encoder_info_frame);
+}
+
+void hwss_stream_enc_update_dp_info_packets(union block_sequence_params *params)
+{
+	if (params->stream_enc_update_dp_info_packets_params.pipe_ctx->stream_res.stream_enc &&
+	    params->stream_enc_update_dp_info_packets_params.pipe_ctx->stream_res.stream_enc->funcs->update_dp_info_packets)
+		params->stream_enc_update_dp_info_packets_params.pipe_ctx->stream_res.stream_enc->funcs->update_dp_info_packets(
+			params->stream_enc_update_dp_info_packets_params.pipe_ctx->stream_res.stream_enc,
+			&params->stream_enc_update_dp_info_packets_params.pipe_ctx->stream_res.encoder_info_frame);
+}
+
+void hwss_stream_enc_dp_set_dsc_config(union block_sequence_params *params)
+{
+	if (params->stream_enc_dp_set_dsc_config_params.stream_enc &&
+	    params->stream_enc_dp_set_dsc_config_params.stream_enc->funcs->dp_set_dsc_config) {
+		enum optc_dsc_mode dsc_mode = OPTC_DSC_DISABLED;
+		uint32_t dsc_bytes_per_pixel = 0;
+		uint32_t dsc_slice_width = 0;
+		const struct dsc_optc_config *dsc_optc_cfg = params->stream_enc_dp_set_dsc_config_params.dsc_optc_cfg;
+
+		if (dsc_optc_cfg) {
+			dsc_mode = dsc_optc_cfg->is_pixel_format_444 ?
+				OPTC_DSC_ENABLED_444 : OPTC_DSC_ENABLED_NATIVE_SUBSAMPLED;
+			dsc_bytes_per_pixel = dsc_optc_cfg->bytes_per_pixel;
+			dsc_slice_width = dsc_optc_cfg->slice_width;
+		}
+
+		params->stream_enc_dp_set_dsc_config_params.stream_enc->funcs->dp_set_dsc_config(
+			params->stream_enc_dp_set_dsc_config_params.stream_enc,
+			dsc_mode, dsc_bytes_per_pixel, dsc_slice_width);
+	}
+}
+
+void hwss_hpo_dp_stream_enc_dp_set_dsc_pps_info_packet(union block_sequence_params *params)
+{
+	if (params->hpo_dp_stream_enc_dp_set_dsc_pps_info_packet_params.hpo_dp_stream_enc &&
+	    params->hpo_dp_stream_enc_dp_set_dsc_pps_info_packet_params.hpo_dp_stream_enc->funcs->dp_set_dsc_pps_info_packet)
+		params->hpo_dp_stream_enc_dp_set_dsc_pps_info_packet_params.hpo_dp_stream_enc->funcs->dp_set_dsc_pps_info_packet(
+			params->hpo_dp_stream_enc_dp_set_dsc_pps_info_packet_params.hpo_dp_stream_enc,
+			params->hpo_dp_stream_enc_dp_set_dsc_pps_info_packet_params.immediate_update,
+			params->hpo_dp_stream_enc_dp_set_dsc_pps_info_packet_params.dsc_packed_pps,
+			params->hpo_dp_stream_enc_dp_set_dsc_pps_info_packet_params.pps_sdp_stream);
+}
+
+void hwss_stream_enc_dp_set_dsc_pps_info_packet(union block_sequence_params *params)
+{
+	if (params->stream_enc_dp_set_dsc_pps_info_packet_params.stream_enc &&
+	    params->stream_enc_dp_set_dsc_pps_info_packet_params.stream_enc->funcs->dp_set_dsc_pps_info_packet)
+		params->stream_enc_dp_set_dsc_pps_info_packet_params.stream_enc->funcs->dp_set_dsc_pps_info_packet(
+			params->stream_enc_dp_set_dsc_pps_info_packet_params.stream_enc,
+			params->stream_enc_dp_set_dsc_pps_info_packet_params.immediate_update,
+			params->stream_enc_dp_set_dsc_pps_info_packet_params.dsc_packed_pps,
+			params->stream_enc_dp_set_dsc_pps_info_packet_params.pps_sdp_stream);
+}
+
+void hwss_set_dmdata_attributes(union block_sequence_params *params)
+{
+	struct hubp *hubp = params->set_dmdata_attributes_params.hubp;
+
+	if (!hubp || !hubp->funcs->dmdata_set_attributes)
+		return;
+
+	hubp->funcs->dmdata_set_attributes(hubp,
+		&params->set_dmdata_attributes_params.attr);
+}
+
+void hwss_dp_trace_source_sequence(union block_sequence_params *params)
+{
+	struct dc_link *link = params->dp_trace_source_sequence_params.link;
+	enum dpcd_source_sequence source = params->dp_trace_source_sequence_params.source;
+
+	if (link && link->dc && link->dc->link_srv && link->dc->link_srv->dp_trace_source_sequence)
+		link->dc->link_srv->dp_trace_source_sequence(link, source);
+}
+
+void hwss_link_increase_mst_payload(union block_sequence_params *params)
+{
+	struct pipe_ctx *pipe_ctx = params->link_increase_mst_payload_params.pipe_ctx;
+	uint32_t mst_stream_bw = params->link_increase_mst_payload_params.mst_stream_bw;
+
+	if (pipe_ctx && pipe_ctx->stream && pipe_ctx->stream->link &&
+		pipe_ctx->stream->link->dc && pipe_ctx->stream->link->dc->link_srv &&
+		pipe_ctx->stream->link->dc->link_srv->increase_mst_payload)
+		pipe_ctx->stream->link->dc->link_srv->increase_mst_payload(pipe_ctx, mst_stream_bw);
+}
+
+void hwss_link_reduce_mst_payload(union block_sequence_params *params)
+{
+	struct pipe_ctx *pipe_ctx = params->link_reduce_mst_payload_params.pipe_ctx;
+	uint32_t mst_stream_bw = params->link_reduce_mst_payload_params.mst_stream_bw;
+
+	if (pipe_ctx && pipe_ctx->stream && pipe_ctx->stream->link &&
+		pipe_ctx->stream->link->dc && pipe_ctx->stream->link->dc->link_srv &&
+		pipe_ctx->stream->link->dc->link_srv->reduce_mst_payload)
+		pipe_ctx->stream->link->dc->link_srv->reduce_mst_payload(pipe_ctx, mst_stream_bw);
+}
+
+void hwss_dp_set_test_pattern(union block_sequence_params *params)
+{
+	struct dc_link *link = params->dp_set_test_pattern_params.link;
+	enum dp_test_pattern test_pattern = params->dp_set_test_pattern_params.test_pattern;
+	enum dp_test_pattern_color_space test_pattern_color_space =
+	params->dp_set_test_pattern_params.test_pattern_color_space;
+	const struct link_training_settings *p_link_settings =
+	params->dp_set_test_pattern_params.p_link_settings;
+	const unsigned char *p_custom_pattern = params->dp_set_test_pattern_params.p_custom_pattern;
+	unsigned int cust_pattern_size = params->dp_set_test_pattern_params.cust_pattern_size;
+
+	if (link && link->dc && link->dc->link_srv && link->dc->link_srv->dp_set_test_pattern)
+		link->dc->link_srv->dp_set_test_pattern(link, test_pattern, test_pattern_color_space,
+			p_link_settings, p_custom_pattern, cust_pattern_size);
+}
+
+void hwss_link_set_dpms_off(union block_sequence_params *params)
+{
+	struct pipe_ctx *pipe_ctx = params->link_set_dpms_off_params.pipe_ctx;
+
+	if (pipe_ctx && pipe_ctx->stream && pipe_ctx->stream->link &&
+	    pipe_ctx->stream->link->dc && pipe_ctx->stream->link->dc->link_srv &&
+	    pipe_ctx->stream->link->dc->link_srv->set_dpms_off)
+		pipe_ctx->stream->link->dc->link_srv->set_dpms_off(pipe_ctx);
+}
+
+void hwss_disable_audio_stream(struct dc *dc, union block_sequence_params *params)
+{
+	if (dc->hwss.disable_audio_stream)
+		dc->hwss.disable_audio_stream(
+			params->disable_audio_stream_params.pipe_ctx);
+}
+
+void hwss_prepare_bandwidth(struct dc *dc, union block_sequence_params *params)
+{
+	if (dc && dc->hwss.prepare_bandwidth)
+		dc->hwss.prepare_bandwidth(dc,
+			params->prepare_bandwidth_params.context);
+}
+
+void hwss_link_set_dpms_on(union block_sequence_params *params)
+{
+	struct dc_state *state = params->link_set_dpms_on_params.state;
+	struct pipe_ctx *pipe_ctx = params->link_set_dpms_on_params.pipe_ctx;
+
+	if (pipe_ctx && pipe_ctx->stream && pipe_ctx->stream->link &&
+	    pipe_ctx->stream->link->dc && pipe_ctx->stream->link->dc->link_srv &&
+	    pipe_ctx->stream->link->dc->link_srv->set_dpms_on)
+		pipe_ctx->stream->link->dc->link_srv->set_dpms_on(state, pipe_ctx);
+}
+
+void hwss_dsc_set_config_simple(union block_sequence_params *params)
+{
+	struct display_stream_compressor *dsc = params->dsc_set_config_simple_params.dsc;
+	struct dsc_config *dsc_cfg = &params->dsc_set_config_simple_params.dsc_cfg;
+	struct dsc_optc_config *dsc_optc_cfg = &params->dsc_set_config_simple_params.dsc_optc_cfg;
+
+	if (dsc && dsc->funcs && dsc->funcs->dsc_set_config)
+		dsc->funcs->dsc_set_config(dsc, dsc_cfg, dsc_optc_cfg);
 }
 
 void hwss_add_dccg_set_dto_dscclk(struct block_sequence_state *seq_state,
@@ -4105,6 +4632,313 @@ void hwss_add_tg_get_frame_count(struct block_sequence_state *seq_state,
 		seq_state->steps[*seq_state->num_steps].func = TG_GET_FRAME_COUNT;
 		seq_state->steps[*seq_state->num_steps].params.tg_get_frame_count_params.tg = tg;
 		seq_state->steps[*seq_state->num_steps].params.tg_get_frame_count_params.frame_count = frame_count;
+		(*seq_state->num_steps)++;
+	}
+}
+
+void hwss_add_begin_cursor_offload_update(struct block_sequence_state *seq_state,
+		struct dc *dc,
+		struct pipe_ctx *pipe_ctx)
+{
+	if (*seq_state->num_steps < MAX_HWSS_BLOCK_SEQUENCE_SIZE) {
+		seq_state->steps[*seq_state->num_steps].func = HWSS_BEGIN_CURSOR_OFFLOAD_UPDATE;
+		seq_state->steps[*seq_state->num_steps].params.begin_cursor_offload_update_params.dc = dc;
+		seq_state->steps[*seq_state->num_steps].params.begin_cursor_offload_update_params.pipe_ctx = pipe_ctx;
+		(*seq_state->num_steps)++;
+	}
+}
+
+void hwss_add_cursor_lock(struct block_sequence_state *seq_state,
+		struct dc *dc,
+		struct pipe_ctx *pipe_ctx,
+		bool lock)
+{
+	/* cursor lock is per MPCC tree, so only need to lock one pipe per stream */
+	if (!pipe_ctx || pipe_ctx->top_pipe)
+		return;
+
+	if (*seq_state->num_steps < MAX_HWSS_BLOCK_SEQUENCE_SIZE) {
+		seq_state->steps[*seq_state->num_steps].func = HWSS_CURSOR_LOCK;
+		seq_state->steps[*seq_state->num_steps].params.cursor_lock_params.dc = dc;
+		seq_state->steps[*seq_state->num_steps].params.cursor_lock_params.pipe_ctx = pipe_ctx;
+		seq_state->steps[*seq_state->num_steps].params.cursor_lock_params.lock = lock;
+		(*seq_state->num_steps)++;
+	}
+}
+
+void hwss_add_send_update_cursor_info_to_dmu(struct block_sequence_state *seq_state,
+		struct pipe_ctx *pipe_ctx,
+		int index)
+{
+	if (*seq_state->num_steps < MAX_HWSS_BLOCK_SEQUENCE_SIZE) {
+		seq_state->steps[*seq_state->num_steps].func = DC_SEND_CURSOR_INFO_TO_DMU;
+		seq_state->steps[*seq_state->num_steps].params.send_cursor_info_to_dmu_params.pipe_ctx = pipe_ctx;
+		seq_state->steps[*seq_state->num_steps].params.send_cursor_info_to_dmu_params.pipe_idx = index;
+		(*seq_state->num_steps)++;
+	}
+}
+
+void hwss_add_update_cursor_offload_pipe(struct block_sequence_state *seq_state,
+		struct dc *dc,
+		struct pipe_ctx *pipe_ctx)
+{
+	if (*seq_state->num_steps < MAX_HWSS_BLOCK_SEQUENCE_SIZE) {
+		seq_state->steps[*seq_state->num_steps].func = HWSS_UPDATE_CURSOR_OFFLOAD_PIPE;
+		seq_state->steps[*seq_state->num_steps].params.update_cursor_offload_pipe_params.dc = dc;
+		seq_state->steps[*seq_state->num_steps].params.update_cursor_offload_pipe_params.pipe_ctx = pipe_ctx;
+		(*seq_state->num_steps)++;
+	}
+}
+
+void hwss_add_commit_cursor_offload_update(struct block_sequence_state *seq_state,
+		struct dc *dc,
+		struct pipe_ctx *pipe_ctx)
+{
+	if (*seq_state->num_steps < MAX_HWSS_BLOCK_SEQUENCE_SIZE) {
+		seq_state->steps[*seq_state->num_steps].func = HWSS_COMMIT_CURSOR_OFFLOAD_UPDATE;
+		seq_state->steps[*seq_state->num_steps].params.commit_cursor_offload_update_params.dc = dc;
+		seq_state->steps[*seq_state->num_steps].params.commit_cursor_offload_update_params.pipe_ctx = pipe_ctx;
+		(*seq_state->num_steps)++;
+	}
+}
+
+void hwss_add_stream_enc_update_hdmi_info_packets(struct block_sequence_state *seq_state,
+		struct pipe_ctx *pipe_ctx)
+{
+	if (*seq_state->num_steps < MAX_HWSS_BLOCK_SEQUENCE_SIZE) {
+		seq_state->steps[*seq_state->num_steps].func = STREAM_ENC_UPDATE_HDMI_INFO_PACKETS;
+		seq_state->steps[*seq_state->num_steps].params.stream_enc_update_hdmi_info_packets_params.pipe_ctx = pipe_ctx;
+		(*seq_state->num_steps)++;
+	}
+}
+
+void hwss_add_hpo_dp_stream_enc_update_dp_info_packets_sdp_line_num(struct block_sequence_state *seq_state,
+		struct pipe_ctx *pipe_ctx)
+{
+	if (*seq_state->num_steps < MAX_HWSS_BLOCK_SEQUENCE_SIZE) {
+		seq_state->steps[*seq_state->num_steps].func = HPO_DP_STREAM_ENC_UPDATE_DP_INFO_PACKETS_SDP_LINE_NUM;
+		seq_state->steps[*seq_state->num_steps].params.hpo_dp_stream_enc_update_dp_info_packets_sdp_line_num_params.pipe_ctx = pipe_ctx;
+		(*seq_state->num_steps)++;
+	}
+}
+
+void hwss_add_hpo_dp_stream_enc_update_dp_info_packets(struct block_sequence_state *seq_state,
+		struct pipe_ctx *pipe_ctx)
+{
+	if (*seq_state->num_steps < MAX_HWSS_BLOCK_SEQUENCE_SIZE) {
+		seq_state->steps[*seq_state->num_steps].func = HPO_DP_STREAM_ENC_UPDATE_DP_INFO_PACKETS;
+		seq_state->steps[*seq_state->num_steps].params.hpo_dp_stream_enc_update_dp_info_packets_params.pipe_ctx = pipe_ctx;
+		(*seq_state->num_steps)++;
+	}
+}
+
+void hwss_add_stream_enc_update_dp_info_packets_sdp_line_num(struct block_sequence_state *seq_state,
+		struct pipe_ctx *pipe_ctx)
+{
+	if (*seq_state->num_steps < MAX_HWSS_BLOCK_SEQUENCE_SIZE) {
+		seq_state->steps[*seq_state->num_steps].func = STREAM_ENC_UPDATE_DP_INFO_PACKETS_SDP_LINE_NUM;
+		seq_state->steps[*seq_state->num_steps].params.stream_enc_update_dp_info_packets_sdp_line_num_params.pipe_ctx = pipe_ctx;
+		(*seq_state->num_steps)++;
+	}
+}
+
+void hwss_add_stream_enc_update_dp_info_packets(struct block_sequence_state *seq_state,
+		struct pipe_ctx *pipe_ctx)
+{
+	if (*seq_state->num_steps < MAX_HWSS_BLOCK_SEQUENCE_SIZE) {
+		seq_state->steps[*seq_state->num_steps].func = STREAM_ENC_UPDATE_DP_INFO_PACKETS;
+		seq_state->steps[*seq_state->num_steps].params.stream_enc_update_dp_info_packets_params.pipe_ctx = pipe_ctx;
+		(*seq_state->num_steps)++;
+	}
+}
+
+void hwss_add_dsc_set_config(struct block_sequence_state *seq_state,
+		struct display_stream_compressor *dsc,
+		const struct dsc_config *dsc_cfg,
+		const struct dsc_optc_config *dsc_optc_cfg)
+{
+	if (*seq_state->num_steps < MAX_HWSS_BLOCK_SEQUENCE_SIZE) {
+		seq_state->steps[*seq_state->num_steps].func = DSC_SET_CONFIG_SIMPLE;
+		seq_state->steps[*seq_state->num_steps].params.dsc_set_config_simple_params.dsc = dsc;
+		seq_state->steps[*seq_state->num_steps].params.dsc_set_config_simple_params.dsc_cfg = *dsc_cfg;
+		seq_state->steps[*seq_state->num_steps].params.dsc_set_config_simple_params.dsc_optc_cfg = *dsc_optc_cfg;
+		(*seq_state->num_steps)++;
+	}
+}
+
+void hwss_add_stream_enc_dp_set_dsc_config(struct block_sequence_state *seq_state,
+		struct stream_encoder *stream_enc,
+		const struct dsc_optc_config *dsc_optc_cfg)
+{
+	if (*seq_state->num_steps < MAX_HWSS_BLOCK_SEQUENCE_SIZE) {
+		seq_state->steps[*seq_state->num_steps].func = STREAM_ENC_DP_SET_DSC_CONFIG;
+		seq_state->steps[*seq_state->num_steps].params.stream_enc_dp_set_dsc_config_params.stream_enc = stream_enc;
+		seq_state->steps[*seq_state->num_steps].params.stream_enc_dp_set_dsc_config_params.dsc_optc_cfg = dsc_optc_cfg;
+		(*seq_state->num_steps)++;
+	}
+}
+
+void hwss_add_hpo_dp_stream_enc_dp_set_dsc_pps_info_packet(struct block_sequence_state *seq_state,
+		struct hpo_dp_stream_encoder *hpo_dp_stream_enc,
+		bool immediate_update,
+		uint8_t *dsc_packed_pps,
+		bool pps_sdp_stream)
+{
+	if (*seq_state->num_steps < MAX_HWSS_BLOCK_SEQUENCE_SIZE) {
+		seq_state->steps[*seq_state->num_steps].func = HPO_DP_STREAM_ENC_DP_SET_DSC_PPS_INFO_PACKET;
+		seq_state->steps[*seq_state->num_steps].params.hpo_dp_stream_enc_dp_set_dsc_pps_info_packet_params.hpo_dp_stream_enc = hpo_dp_stream_enc;
+		seq_state->steps[*seq_state->num_steps].params.hpo_dp_stream_enc_dp_set_dsc_pps_info_packet_params.immediate_update = immediate_update;
+		seq_state->steps[*seq_state->num_steps].params.hpo_dp_stream_enc_dp_set_dsc_pps_info_packet_params.dsc_packed_pps = dsc_packed_pps;
+		seq_state->steps[*seq_state->num_steps].params.hpo_dp_stream_enc_dp_set_dsc_pps_info_packet_params.pps_sdp_stream = pps_sdp_stream;
+		(*seq_state->num_steps)++;
+	}
+}
+
+void hwss_add_stream_enc_dp_set_dsc_pps_info_packet(struct block_sequence_state *seq_state,
+		struct stream_encoder *stream_enc,
+		bool immediate_update,
+		uint8_t *dsc_packed_pps,
+		bool pps_sdp_stream)
+{
+	if (*seq_state->num_steps < MAX_HWSS_BLOCK_SEQUENCE_SIZE) {
+		seq_state->steps[*seq_state->num_steps].func = STREAM_ENC_DP_SET_DSC_PPS_INFO_PACKET;
+		seq_state->steps[*seq_state->num_steps].params.stream_enc_dp_set_dsc_pps_info_packet_params.stream_enc = stream_enc;
+		seq_state->steps[*seq_state->num_steps].params.stream_enc_dp_set_dsc_pps_info_packet_params.immediate_update = immediate_update;
+		seq_state->steps[*seq_state->num_steps].params.stream_enc_dp_set_dsc_pps_info_packet_params.dsc_packed_pps = dsc_packed_pps;
+		seq_state->steps[*seq_state->num_steps].params.stream_enc_dp_set_dsc_pps_info_packet_params.pps_sdp_stream = pps_sdp_stream;
+		(*seq_state->num_steps)++;
+	}
+}
+
+void hwss_add_setup_periodic_interrupt(struct block_sequence_state *seq_state,
+		struct dc *dc,
+		struct pipe_ctx *pipe_ctx)
+{
+	if (*seq_state->num_steps < MAX_HWSS_BLOCK_SEQUENCE_SIZE) {
+		seq_state->steps[*seq_state->num_steps].func = HWSS_SETUP_PERIODIC_INTERRUPT;
+		seq_state->steps[*seq_state->num_steps].params.setup_periodic_interrupt_params.dc = dc;
+		seq_state->steps[*seq_state->num_steps].params.setup_periodic_interrupt_params.pipe_ctx = pipe_ctx;
+		(*seq_state->num_steps)++;
+	}
+}
+
+void hwss_add_dp_trace_source_sequence(struct block_sequence_state *seq_state,
+		struct dc_link *link,
+		enum dpcd_source_sequence source)
+{
+	if (*seq_state->num_steps < MAX_HWSS_BLOCK_SEQUENCE_SIZE) {
+		seq_state->steps[*seq_state->num_steps].func = DP_TRACE_SOURCE_SEQUENCE;
+		seq_state->steps[*seq_state->num_steps].params.dp_trace_source_sequence_params.link = link;
+		seq_state->steps[*seq_state->num_steps].params.dp_trace_source_sequence_params.source = source;
+		(*seq_state->num_steps)++;
+	}
+}
+
+void hwss_add_set_dmdata_attributes(struct block_sequence_state *seq_state,
+		struct pipe_ctx *pipe_ctx)
+{
+	if (*seq_state->num_steps < MAX_HWSS_BLOCK_SEQUENCE_SIZE) {
+		struct dc_dmdata_attributes *attr =
+			&seq_state->steps[*seq_state->num_steps].params.set_dmdata_attributes_params.attr;
+
+		memset(attr, 0, sizeof(*attr));
+		attr->dmdata_mode = DMDATA_HW_MODE;
+		attr->dmdata_size = dc_is_hdmi_signal(pipe_ctx->stream->signal) ? 32 : 36;
+		attr->address.quad_part = pipe_ctx->stream->dmdata_address.quad_part;
+		attr->dmdata_repeat = 1; /* always repeat */
+		attr->dmdata_updated = 1;
+
+		seq_state->steps[*seq_state->num_steps].func = HUBP_SET_DMDATA_ATTRIBUTES;
+		seq_state->steps[*seq_state->num_steps].params.set_dmdata_attributes_params.hubp =
+			pipe_ctx->plane_res.hubp;
+		(*seq_state->num_steps)++;
+	}
+}
+
+void hwss_add_link_increase_mst_payload(struct block_sequence_state *seq_state,
+		struct pipe_ctx *pipe_ctx,
+		uint32_t mst_stream_bw)
+{
+	if (*seq_state->num_steps < MAX_HWSS_BLOCK_SEQUENCE_SIZE) {
+		seq_state->steps[*seq_state->num_steps].func = LINK_INCREASE_MST_PAYLOAD;
+		seq_state->steps[*seq_state->num_steps].params.link_increase_mst_payload_params.pipe_ctx = pipe_ctx;
+		seq_state->steps[*seq_state->num_steps].params.link_increase_mst_payload_params.mst_stream_bw = mst_stream_bw;
+		(*seq_state->num_steps)++;
+	}
+}
+
+void hwss_add_link_reduce_mst_payload(struct block_sequence_state *seq_state,
+		struct pipe_ctx *pipe_ctx,
+		uint32_t mst_stream_bw)
+{
+	if (*seq_state->num_steps < MAX_HWSS_BLOCK_SEQUENCE_SIZE) {
+		seq_state->steps[*seq_state->num_steps].func = LINK_REDUCE_MST_PAYLOAD;
+		seq_state->steps[*seq_state->num_steps].params.link_reduce_mst_payload_params.pipe_ctx = pipe_ctx;
+		seq_state->steps[*seq_state->num_steps].params.link_reduce_mst_payload_params.mst_stream_bw = mst_stream_bw;
+		(*seq_state->num_steps)++;
+	}
+}
+
+void hwss_add_dp_set_test_pattern(struct block_sequence_state *seq_state,
+		struct dc_link *link,
+		enum dp_test_pattern test_pattern,
+		enum dp_test_pattern_color_space test_pattern_color_space,
+		const struct link_training_settings *p_link_settings,
+		const unsigned char *p_custom_pattern,
+		unsigned int cust_pattern_size)
+{
+	if (*seq_state->num_steps < MAX_HWSS_BLOCK_SEQUENCE_SIZE) {
+		seq_state->steps[*seq_state->num_steps].func = DP_SET_TEST_PATTERN;
+		seq_state->steps[*seq_state->num_steps].params.dp_set_test_pattern_params.link = link;
+		seq_state->steps[*seq_state->num_steps].params.dp_set_test_pattern_params.test_pattern = test_pattern;
+		seq_state->steps[*seq_state->num_steps].params.dp_set_test_pattern_params.test_pattern_color_space = test_pattern_color_space;
+		seq_state->steps[*seq_state->num_steps].params.dp_set_test_pattern_params.p_link_settings = p_link_settings;
+		seq_state->steps[*seq_state->num_steps].params.dp_set_test_pattern_params.p_custom_pattern = p_custom_pattern;
+		seq_state->steps[*seq_state->num_steps].params.dp_set_test_pattern_params.cust_pattern_size = cust_pattern_size;
+		(*seq_state->num_steps)++;
+	}
+}
+
+void hwss_add_link_set_dpms_off(struct block_sequence_state *seq_state,
+		struct pipe_ctx *pipe_ctx)
+{
+	if (*seq_state->num_steps < MAX_HWSS_BLOCK_SEQUENCE_SIZE) {
+		seq_state->steps[*seq_state->num_steps].func = LINK_SET_DPMS_OFF;
+		seq_state->steps[*seq_state->num_steps].params.link_set_dpms_off_params.pipe_ctx = pipe_ctx;
+		(*seq_state->num_steps)++;
+	}
+}
+
+void hwss_add_disable_audio_stream(struct block_sequence_state *seq_state,
+		struct pipe_ctx *pipe_ctx)
+{
+	if (*seq_state->num_steps < MAX_HWSS_BLOCK_SEQUENCE_SIZE) {
+		seq_state->steps[*seq_state->num_steps].func = DISABLE_AUDIO_STREAM;
+		seq_state->steps[*seq_state->num_steps].params.disable_audio_stream_params.pipe_ctx = pipe_ctx;
+		(*seq_state->num_steps)++;
+	}
+}
+
+void hwss_add_prepare_bandwidth(struct block_sequence_state *seq_state,
+		struct dc *dc,
+		struct dc_state *context)
+{
+	if (*seq_state->num_steps < MAX_HWSS_BLOCK_SEQUENCE_SIZE) {
+		seq_state->steps[*seq_state->num_steps].func = PREPARE_BANDWIDTH;
+		seq_state->steps[*seq_state->num_steps].params.prepare_bandwidth_params.dc = dc;
+		seq_state->steps[*seq_state->num_steps].params.prepare_bandwidth_params.context = context;
+		(*seq_state->num_steps)++;
+	}
+}
+
+void hwss_add_link_set_dpms_on(struct block_sequence_state *seq_state,
+		struct dc_state *state,
+		struct pipe_ctx *pipe_ctx)
+{
+	if (*seq_state->num_steps < MAX_HWSS_BLOCK_SEQUENCE_SIZE) {
+		seq_state->steps[*seq_state->num_steps].func = LINK_SET_DPMS_ON;
+		seq_state->steps[*seq_state->num_steps].params.link_set_dpms_on_params.state = state;
+		seq_state->steps[*seq_state->num_steps].params.link_set_dpms_on_params.pipe_ctx = pipe_ctx;
 		(*seq_state->num_steps)++;
 	}
 }
