@@ -37,7 +37,7 @@
 #include <drm/drm_print.h>
 #include <drm/drm_util.h>
 
-/* Detach the cursor from the bulk move list */
+/* Detach the cursor from the bulk move list*/
 static void
 ttm_resource_cursor_clear_bulk(struct ttm_resource_cursor *cursor)
 {
@@ -105,9 +105,9 @@ void ttm_resource_cursor_init(struct ttm_resource_cursor *cursor,
  * ttm_resource_cursor_fini() - Finalize the LRU list cursor usage
  * @cursor: The struct ttm_resource_cursor to finalize.
  *
- * The function pulls the LRU list cursor off any lists it was previously
+ * The function pulls the LRU list cursor off any lists it was previusly
  * attached to. Needs to be called with the LRU lock held. The function
- * can be called multiple times after each other.
+ * can be called multiple times after eachother.
  */
 void ttm_resource_cursor_fini(struct ttm_resource_cursor *cursor)
 {
@@ -330,10 +330,10 @@ void ttm_resource_move_to_lru_tail(struct ttm_resource *res)
 }
 
 /**
- * ttm_resource_init - resource object constructor
- * @bo: buffer object this resource is allocated for
+ * ttm_resource_init - resource object constructure
+ * @bo: buffer object this resources is allocated for
  * @place: placement of the resource
- * @res: the resource object to initialize
+ * @res: the resource object to inistilize
  *
  * Initialize a new resource object. Counterpart of ttm_resource_fini().
  */
@@ -386,33 +386,52 @@ void ttm_resource_fini(struct ttm_resource_manager *man,
 }
 EXPORT_SYMBOL(ttm_resource_fini);
 
-int ttm_resource_alloc(struct ttm_buffer_object *bo,
-		       const struct ttm_place *place,
-		       struct ttm_resource **res_ptr,
-		       struct dmem_cgroup_pool_state **ret_limit_pool)
+/**
+ * ttm_resource_try_charge - charge a resource manager's cgroup pool
+ * @bo: buffer for which an allocation should be charged
+ * @place: where the allocation is attempted to be placed
+ * @ret_pool: on charge success, the pool that was charged
+ * @ret_limit_pool: on charge failure, the pool responsible for the failure
+ *
+ * Should be used to charge cgroups before attempting resource allocation.
+ * When charging succeeds, the value of ret_pool should be passed to
+ * ttm_resource_alloc.
+ *
+ * Returns: 0 on charge success, negative errno on failure.
+ */
+int ttm_resource_try_charge(struct ttm_buffer_object *bo,
+			    const struct ttm_place *place,
+			    struct dmem_cgroup_pool_state **ret_pool,
+			    struct dmem_cgroup_pool_state **ret_limit_pool)
 {
 	struct ttm_resource_manager *man =
 		ttm_manager_type(bo->bdev, place->mem_type);
-	struct dmem_cgroup_pool_state *pool = NULL;
+
+	if (!man->cg) {
+		*ret_pool = NULL;
+		if (ret_limit_pool)
+			*ret_limit_pool = NULL;
+		return 0;
+	}
+
+	return dmem_cgroup_try_charge(man->cg, bo->base.size, ret_pool,
+				      ret_limit_pool);
+}
+
+int ttm_resource_alloc(struct ttm_buffer_object *bo,
+		       const struct ttm_place *place,
+		       struct ttm_resource **res_ptr,
+		       struct dmem_cgroup_pool_state *charge_pool)
+{
+	struct ttm_resource_manager *man =
+		ttm_manager_type(bo->bdev, place->mem_type);
 	int ret;
 
-	if (man->cg) {
-		ret = dmem_cgroup_try_charge(man->cg, bo->base.size, &pool, ret_limit_pool);
-		if (ret) {
-			if (ret == -EAGAIN)
-				ret = -ENOSPC;
-			return ret;
-		}
-	}
-
 	ret = man->func->alloc(man, bo, place, res_ptr);
-	if (ret) {
-		if (pool)
-			dmem_cgroup_uncharge(pool, bo->base.size);
+	if (ret)
 		return ret;
-	}
 
-	(*res_ptr)->css = pool;
+	(*res_ptr)->css = charge_pool;
 
 	spin_lock(&bo->bdev->lru_lock);
 	ttm_resource_add_bulk_move(*res_ptr, bo);
@@ -451,7 +470,7 @@ EXPORT_SYMBOL(ttm_resource_free);
  * @size: How many bytes the new allocation needs.
  *
  * Test if @res intersects with @place and @size. Used for testing if evictions
- * are valuable or not.
+ * are valueable or not.
  *
  * Returns true if the res placement intersects with @place and @size.
  */
@@ -529,7 +548,7 @@ void ttm_resource_set_bo(struct ttm_resource *res,
  * @bdev: ttm device this manager belongs to
  * @size: size of managed resources in arbitrary units
  *
- * Initialize core parts of a manager object.
+ * Initialise core parts of a manager object.
  */
 void ttm_resource_manager_init(struct ttm_resource_manager *man,
 			       struct ttm_device *bdev,
@@ -552,8 +571,8 @@ EXPORT_SYMBOL(ttm_resource_manager_init);
 /*
  * ttm_resource_manager_evict_all
  *
- * @bdev: device to use
- * @man: manager to use
+ * @bdev - device to use
+ * @man - manager to use
  *
  * Evict all the objects out of a memory manager until it is empty.
  * Part of memory manager cleanup sequence.
@@ -898,7 +917,7 @@ out_err:
 
 /**
  * ttm_kmap_iter_linear_io_fini - Clean up an iterator for linear io memory
- * @iter_io: The iterator to finalize
+ * @iter_io: The iterator to initialize
  * @bdev: The TTM device
  * @mem: The ttm resource representing the iomap.
  *
@@ -937,15 +956,15 @@ DEFINE_SHOW_ATTRIBUTE(ttm_resource_manager);
 /**
  * ttm_resource_manager_create_debugfs - Create debugfs entry for specified
  * resource manager.
- * @man: The TTM resource manager for which the debugfs stats file to be created
+ * @man: The TTM resource manager for which the debugfs stats file be creates
  * @parent: debugfs directory in which the file will reside
  * @name: The filename to create.
  *
- * This function sets up a debugfs file that can be used to look
+ * This function setups up a debugfs file that can be used to look
  * at debug statistics of the specified ttm_resource_manager.
  */
 void ttm_resource_manager_create_debugfs(struct ttm_resource_manager *man,
-					 struct dentry *parent,
+					 struct dentry * parent,
 					 const char *name)
 {
 #if defined(CONFIG_DEBUG_FS)
